@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 from typing import Any, List
 
 from dotenv import load_dotenv
@@ -54,7 +55,32 @@ CHUNK_INDEX_FIELD = "chunk_index"
 VERSION_FIELD = "version"
 CONTENT_HASH_FIELD = "content_hash"
 VECTOR_DIMENSION = 512
+RETRIEVE_K = 8
+RERANK_TOP_K = 4
+CONTEXT_MAX_CHARS = 1800
 TOP_K = 3
+
+ENTITY_ALIASES = {
+    "黑神话悟空": "黑神话：悟空",
+    "黑神话:悟空": "黑神话：悟空",
+    "黑神话：悟空": "黑神话：悟空",
+}
+
+FACTUAL_KEYWORDS = [
+    "主题曲",
+    "作者",
+    "作曲",
+    "配音",
+    "章节",
+    "发售时间",
+    "发布日期",
+    "上映时间",
+    "主要内容",
+    "剧情",
+    "角色",
+    "导演",
+    "编剧",
+]
 
 
 # =========================
@@ -272,7 +298,7 @@ def upsert_document(
         doc.metadata[FILENAME_FIELD] = doc_meta["filename"]
         doc.metadata[SOURCE_FIELD] = doc_meta["source"]
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=60)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=40)
     chunks = splitter.split_documents(docs)
 
     version = int(doc_meta.get("version", 0)) + 1
@@ -340,25 +366,196 @@ def build_vectorstore(data_dir: str = DATA_DIR) -> tuple[MilvusClient, HuggingFa
 
 
 # =========================
-# 7) RAG 检索与回答
+# 7) 查询改写 / rerank / 上下文压缩
 # =========================
+def normalize_entity(text: str) -> str:
+    """将常见实体别名归一化为统一写法。"""
+    normalized = text
+    for alias, canonical in ENTITY_ALIASES.items():
+        normalized = normalized.replace(alias, canonical)
+    return normalized
+
+
+def extract_query_terms(question: str) -> dict[str, str]:
+    """提取实体、属性和规范化查询词。"""
+    normalized = normalize_entity(re.sub(r"\s+", "", question))
+    normalized = normalized.replace("？", "?").replace("，", ",")
+    entity = ""
+    attribute = ""
+
+    for attr in FACTUAL_KEYWORDS:
+        if attr in question:
+            attribute = attr
+            break
+
+    for alias in ENTITY_ALIASES:
+        if alias in question:
+            entity = ENTITY_ALIASES[alias]
+            break
+
+    if not entity and "黑神话" in question:
+        entity = "黑神话：悟空"
+    if not entity:
+        m = re.search(r"([\u4e00-\u9fffA-Za-z0-9·：:《》\-]+?)(?:的)?(?:主题曲|作者|作曲|配音|章节|发售时间|发布日期|上映时间|主要内容|剧情|角色|导演|编剧)", question)
+        if m:
+            entity = normalize_entity(m.group(1).strip(" 的：:《》"))
+
+    compact_query_parts = [part for part in [entity, attribute] if part]
+    compact_query = " ".join(compact_query_parts).strip()
+    if not compact_query:
+        compact_query = normalized
+
+    return {
+        "normalized": normalized,
+        "entity": entity,
+        "attribute": attribute,
+        "query": compact_query,
+    }
+
+
+def rewrite_query(question: str) -> str:
+    """先用 LLM 改写查询，让检索更聚焦。"""
+    llm = ChatDeepSeek(
+        api_key=DEEPSEEK_API_KEY,
+        model="deepseek-v4-flash",
+        temperature=0,
+        max_retries=2,
+        streaming=False,
+    )
+    prompt = (
+        "你是查询改写器。请把用户问题改写成更适合向量检索的中文短查询。"
+        "要求：保留核心实体、时间、数量、约束条件；优先保留实体和属性短语；不要回答问题；只输出改写后的查询。\n"
+        f"原始问题：{question}"
+    )
+    response = llm.invoke(prompt)
+    rewritten = response.content.strip() if hasattr(response, "content") else str(response)
+    rewritten = normalize_entity(rewritten)
+    return rewritten or question
+
+
+def expand_query_terms(question: str) -> list[str]:
+    """生成关键词集合，用于补召回与 rerank。"""
+    info = extract_query_terms(question)
+    terms = [info["normalized"], info["query"]]
+
+    if info["entity"]:
+        entity_variants = [
+            info["entity"],
+            info["entity"].replace("：", ""),
+            info["entity"].replace("：", " "),
+            normalize_entity(info["entity"]),
+        ]
+        terms.extend(entity_variants)
+
+    if info["attribute"]:
+        terms.append(info["attribute"])
+
+    for word in FACTUAL_KEYWORDS:
+        if word in question:
+            terms.append(word)
+
+    return [term for term in dict.fromkeys(t.strip() for t in terms if t and t.strip())]
+
+
+def rerank_documents(question: str, docs: List[Document]) -> List[Document]:
+    """对召回结果进行轻量重排序：优先保留更像答案证据的片段。"""
+    terms = expand_query_terms(question)
+    info = extract_query_terms(question)
+
+    def score(doc: Document) -> tuple[int, float, int, int]:
+        text = doc.page_content.lower()
+        filename = doc.metadata.get(FILENAME_FIELD, "")
+        entity_score = sum(3 for term in terms if term and term in text)
+        filename_score = sum(1 for term in terms if term and term in filename)
+        factual_bonus = 0
+        if any(key in text for key in FACTUAL_KEYWORDS):
+            factual_bonus += 4
+        if info["entity"] and normalize_entity(info["entity"]) in text:
+            factual_bonus += 4
+        if info["attribute"] and info["attribute"] in text:
+            factual_bonus += 3
+        if any(term in text for term in terms if term):
+            factual_bonus += 1
+        raw_score = float(doc.metadata.get("score", 0))
+        return entity_score + filename_score + factual_bonus, raw_score, len(text), -doc.metadata.get(CHUNK_INDEX_FIELD, 0)
+
+    return sorted(docs, key=score, reverse=True)
+
+
+def compress_context(docs: List[Document], max_chars: int = CONTEXT_MAX_CHARS) -> str:
+    """压缩上下文，只保留关键证据，减少 prompt 冗余。"""
+    lines: list[str] = []
+    total = 0
+    for doc in docs:
+        filename = doc.metadata.get(FILENAME_FIELD, "未知文件")
+        version = doc.metadata.get(VERSION_FIELD, 0)
+        snippet = doc.page_content.strip()
+        block = f"[来源: {filename} | 版本: {version}]\n{snippet}"
+        if total + len(block) > max_chars:
+            remaining = max_chars - total
+            if remaining <= 0:
+                break
+            block = block[:remaining]
+        lines.append(block)
+        total += len(block)
+        if total >= max_chars:
+            break
+    return "\n\n---\n\n".join(lines)
+
+
+def keyword_boost_recall(question: str, docs: List[Document]) -> List[Document]:
+    """基于关键词对召回结果做补强，避免事实型问题漏召回。"""
+    terms = expand_query_terms(question)
+    if not terms:
+        return docs
+
+    boosted: list[Document] = []
+    seen = set()
+
+    for doc in docs:
+        key = (doc.metadata.get(DOC_ID_FIELD, ""), doc.page_content)
+        if key not in seen:
+            boosted.append(doc)
+            seen.add(key)
+
+    for doc in docs:
+        text = doc.page_content
+        filename = doc.metadata.get(FILENAME_FIELD, "")
+        if any(term in text or term in filename for term in terms):
+            key = (doc.metadata.get(DOC_ID_FIELD, ""), doc.page_content)
+            if key not in seen:
+                boosted.append(doc)
+                seen.add(key)
+
+    return boosted
+
+
 def search_documents(
     question: str,
     client: MilvusClient,
     embeddings: HuggingFaceEmbeddings,
 ) -> List[Document]:
-    """把问题转为向量，并从 Milvus 检索最相关的文本块。"""
-    question_vector = embeddings.embed_query(question)
+    """改写查询后检索，并返回重排序的文本块。"""
+    info = extract_query_terms(question)
+    rewritten_question = rewrite_query(question)
+    compact_query = info["query"] or rewritten_question or question
+    retrieval_query = normalize_entity(" ".join(
+        term for term in [info["entity"], info["attribute"], compact_query] if term
+    ))
+    if not retrieval_query:
+        retrieval_query = normalize_entity(question)
+
+    question_vector = embeddings.embed_query(retrieval_query)
     search_results = client.search(
         collection_name=MILVUS_COLLECTION_NAME,
         data=[question_vector],
         anns_field=VECTOR_FIELD,
-        limit=TOP_K,
-        output_fields=[TEXT_FIELD, FILENAME_FIELD, SOURCE_FIELD, DOC_ID_FIELD, VERSION_FIELD],
+        limit=RETRIEVE_K,
+        output_fields=[TEXT_FIELD, FILENAME_FIELD, SOURCE_FIELD, DOC_ID_FIELD, VERSION_FIELD, CHUNK_INDEX_FIELD],
         search_params={"metric_type": "COSINE", "params": {}},
     )
 
-    documents = []
+    documents: list[Document] = []
     for hit in search_results[0]:
         entity = hit.get("entity", {})
         documents.append(
@@ -369,11 +566,64 @@ def search_documents(
                     FILENAME_FIELD: entity.get(FILENAME_FIELD, "未知文件"),
                     SOURCE_FIELD: entity.get(SOURCE_FIELD, ""),
                     VERSION_FIELD: entity.get(VERSION_FIELD, 0),
+                    CHUNK_INDEX_FIELD: entity.get(CHUNK_INDEX_FIELD, 0),
                     "score": hit.get("distance"),
                 },
             )
         )
-    return documents
+
+    documents = keyword_boost_recall(question, documents)
+    reranked_docs = rerank_documents(retrieval_query, documents)
+    return reranked_docs[:RERANK_TOP_K]
+
+
+def build_factual_direct_context(question: str, client: MilvusClient) -> str:
+    """对事实型问题执行直查，优先抓取同实体同属性的证据。"""
+    info = extract_query_terms(question)
+    entity = info["entity"]
+    attribute = info["attribute"]
+    if not entity or not attribute:
+        return ""
+
+    filter_expr = f'{DOC_ID_FIELD} != ""'
+    try:
+        rows = client.query(
+            collection_name=MILVUS_COLLECTION_NAME,
+            filter=filter_expr,
+            output_fields=[TEXT_FIELD, FILENAME_FIELD, SOURCE_FIELD, DOC_ID_FIELD, VERSION_FIELD, CHUNK_INDEX_FIELD],
+            limit=200,
+        )
+    except Exception:
+        rows = []
+
+    candidates: list[Document] = []
+    normalized_entity = normalize_entity(entity)
+    attribute_terms = [attribute] + [word for word in FACTUAL_KEYWORDS if word == attribute]
+
+    for row in rows:
+        text = row.get(TEXT_FIELD, "")
+        filename = row.get(FILENAME_FIELD, "未知文件")
+        source = row.get(SOURCE_FIELD, "")
+        if normalized_entity in text or entity.replace("：", "") in text or entity in filename:
+            if any(term in text for term in attribute_terms):
+                candidates.append(
+                    Document(
+                        page_content=text,
+                        metadata={
+                            DOC_ID_FIELD: row.get(DOC_ID_FIELD, ""),
+                            FILENAME_FIELD: filename,
+                            SOURCE_FIELD: source,
+                            VERSION_FIELD: row.get(VERSION_FIELD, 0),
+                            CHUNK_INDEX_FIELD: row.get(CHUNK_INDEX_FIELD, 0),
+                            "score": 1.0,
+                        },
+                    )
+                )
+
+    candidates = rerank_documents(question, candidates)
+    if not candidates:
+        return ""
+    return compress_context(candidates, max_chars=1200)
 
 
 def ask_question(
@@ -381,16 +631,27 @@ def ask_question(
     client: MilvusClient,
     embeddings: HuggingFaceEmbeddings,
 ) -> str:
-    docs = search_documents(question, client, embeddings)
+    direct_context = build_factual_direct_context(question, client)
+    docs: list[Document] = []
+
+    if direct_context:
+        docs = [
+            Document(
+                page_content=direct_context,
+                metadata={FILENAME_FIELD: "direct_fact"},
+            )
+        ]
+    else:
+        docs = search_documents(question, client, embeddings)
+
     if not docs:
         return "未找到相关信息。"
 
-    formatted_docs = []
-    for doc in docs:
-        filename = doc.metadata.get(FILENAME_FIELD, "未知文件")
-        version = doc.metadata.get(VERSION_FIELD, 0)
-        formatted_docs.append(f"[来源: {filename} | 版本: {version}]\n{doc.page_content}")
-    context = "\n\n---\n\n".join(formatted_docs)
+    context = compress_context(docs)
+    if not context.strip():
+        context = direct_context
+    if not context.strip():
+        return "未找到相关信息。"
 
     llm = ChatDeepSeek(
         api_key=DEEPSEEK_API_KEY,
